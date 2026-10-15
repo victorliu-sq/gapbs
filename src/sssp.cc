@@ -68,7 +68,10 @@ const size_t kBinSizeThreshold = 1000;
 
 inline
 void RelaxEdges(const WGraph &g, NodeID u, WeightT delta,
-                pvector<WeightT> &dist, vector <vector<NodeID>> &local_bins) {
+                pvector<WeightT> &dist, vector <vector<NodeID>> &local_bins,
+                bool trace = false) {
+  if (trace)  // GACGE: every relaxation, the bin fusion's included (gacge.h)
+    gacge::TraceWork(g.out_degree(u));
   for (WNode wn : g.out_neigh(u)) {
     WeightT old_dist = dist[wn.v];
     WeightT new_dist = dist[u] + wn.w;
@@ -143,7 +146,7 @@ pvector<WeightT>& DeltaStep(const WGraph &g, SSSPState &s, WeightT delta,
       for (size_t i=0; i < curr_frontier_tail; i++) {
         NodeID u = frontier[i];
         if (dist[u] >= delta * static_cast<WeightT>(curr_bin_index))
-          RelaxEdges(g, u, delta, dist, local_bins);
+          RelaxEdges(g, u, delta, dist, local_bins, trace);
       }
       while (curr_bin_index < local_bins.size() &&
              !local_bins[curr_bin_index].empty() &&
@@ -151,7 +154,7 @@ pvector<WeightT>& DeltaStep(const WGraph &g, SSSPState &s, WeightT delta,
         vector<NodeID> curr_bin_copy = local_bins[curr_bin_index];
         local_bins[curr_bin_index].resize(0);
         for (NodeID u : curr_bin_copy)
-          RelaxEdges(g, u, delta, dist, local_bins);
+          RelaxEdges(g, u, delta, dist, local_bins, trace);
       }
       for (size_t i=curr_bin_index; i < local_bins.size(); i++) {
         if (!local_bins[i].empty()) {

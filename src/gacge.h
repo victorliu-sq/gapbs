@@ -83,6 +83,7 @@ inline bool Tracing() { return TraceTrial() >= 0 && trial() == TraceTrial(); }
 
 struct TraceTotals {
   int64_t steps = 0, v = 0, e = 0;
+  int64_t work_e = 0;  // edges a kernel reports as processed (TraceWork), e.g. sssp's relaxations
 };
 inline TraceTotals &totals() {
   static TraceTotals t;
@@ -98,10 +99,14 @@ inline void TraceStep(const char *phase, const char *mode, int64_t frontier_v, i
   t.e += frontier_e;
 }
 
+// Edges processed outside the traced steps' frontiers (sssp: every relaxation,
+// the thread-local bin fusion included); summed into XBTraversal's work_e.
+inline void TraceWork(int64_t edges) { __atomic_fetch_add(&totals().work_e, edges, __ATOMIC_RELAXED); }
+
 inline void TraceEnd(int64_t nodes, int64_t edges) {
   TraceTotals &t = totals();
-  printf("XBTraversal: run=0 steps=%" PRId64 " frontier_v=%" PRId64 " frontier_e=%" PRId64 " nodes=%" PRId64
-         " edges=%" PRId64 "\n", t.steps, t.v, t.e, nodes, edges);
+  printf("XBTraversal: run=0 steps=%" PRId64 " frontier_v=%" PRId64 " frontier_e=%" PRId64 " work_e=%" PRId64
+         " nodes=%" PRId64 " edges=%" PRId64 "\n", t.steps, t.v, t.e, t.work_e, nodes, edges);
   fflush(stdout);
   t = TraceTotals();
 }
