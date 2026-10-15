@@ -165,6 +165,12 @@ struct State {
 // failed CASes of many threads on one taken flag (a hub's tree in augment) no
 // longer bounce its cache line between the cores. GACGE_XB_CAS_ONLY=1: CAS only.
 const bool kCasOnly = getenv("GACGE_XB_CAS_ONLY") != nullptr;
+// GACGE_XB_SEARCHES=1: one XBSearch line per search of trial 0 (its steps,
+// the augmenting paths it found, and the augment claims that took the first
+// tree, failed on the second and released the first); off by default.
+const bool kSearchStats = getenv("GACGE_XB_SEARCHES") != nullptr;
+int64_t search_conflicts = 0;
+
 inline bool TryClaim(int &flag) {
   if (!kCasOnly && __atomic_load_n(&flag, __ATOMIC_RELAXED) != 0) return false;
   return compare_and_swap(flag, 0, 1);
@@ -270,6 +276,7 @@ struct Augment {
     if (!TryClaim(S.select_tree[lo])) return;
     if (!TryClaim(S.select_tree[hi])) {
       Release(S.select_tree[lo]);
+      if (kSearchStats) fetch_and_add(search_conflicts, 1);
       return;
     }
     vector<NodeID> &ap = S.aug_pairs[omp_get_thread_num()];
@@ -465,8 +472,18 @@ void SearchPhase(const Graph &g, State &S) {
 }
 
 pvector<NodeID>& MaximumMatching(const Graph &g, State &S) {
+  const bool stats = kSearchStats && gacge::trial() == 0;
+  int64_t search = 0, steps_before = 0;
   while (true) {
+    search_conflicts = 0;
     SearchPhase(g, S);
+    if (stats) {
+      int64_t paths = 0;
+      for (auto &p : S.aug_pairs) paths += p.size() / 2;
+      printf("XBSearch: index=%" PRId64 " steps=%" PRId64 " paths=%" PRId64 " claim_conflicts=%" PRId64 "\n",
+             search++, part_calls[kExpand] - steps_before, paths, search_conflicts);
+      steps_before = part_calls[kExpand];
+    }
     if (!S.have_paths()) break;
     // each augmenting edge (v, w) owns its two trees: the flips do not overlap
     PartTimer t(kFlip);
