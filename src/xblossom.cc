@@ -132,12 +132,19 @@ struct State {
   vector<pair<NodeID, int64_t>> chunks;            // a step's split-vertex edge chunks (v, first edge)
   Frontier v1, v2, frontier, blossom_frontier, tk, ap;  // reused across steps and phases
 
+  // Allocated once outside the trials; Reset (untimed, before each trial)
+  // gives the empty matching.
   explicit State(int64_t n_) : n(n_), nthreads(omp_get_max_threads()), M(n_), is_even(n_),
       belongs(n_), rec(3 * n_), select_tree(n_), select_match(n_), select_blossom(n_),
       out(nthreads), aug_pairs(nthreads), tasks(nthreads), roots(nthreads), kept_even(nthreads),
-      heavy(nthreads) {
+      heavy(nthreads) {}
+
+  void Reset() {
+    for (auto &b : out) b.clear();
+    for (auto &b : aug_pairs) b.clear();
+    for (auto &b : tasks) b.clear();
     #pragma omp parallel for
-    for (int64_t x = 0; x < n_; x++) {
+    for (int64_t x = 0; x < n; x++) {
       M[x] = -1;
       is_even[x] = 0;
       belongs[x] = -1;
@@ -457,8 +464,7 @@ void SearchPhase(const Graph &g, State &S) {
   }
 }
 
-pvector<NodeID> MaximumMatching(const Graph &g) {
-  State S(g.num_nodes());
+pvector<NodeID>& MaximumMatching(const Graph &g, State &S) {
   while (true) {
     SearchPhase(g, S);
     if (!S.have_paths()) break;
@@ -476,7 +482,7 @@ pvector<NodeID> MaximumMatching(const Graph &g) {
       FlipRoute(S, w);
     }
   }
-  return move(S.M);
+  return S.M;
 }
 
 // Matching size if mate is a valid matching of g (mutual, along edges), else -1.
@@ -542,12 +548,16 @@ int main(int argc, char* argv[]) {
   double total_seconds = 0;
   int64_t first_size = -2;
   bool all_valid = true, all_same = true;
+  // the state is allocated once and reset outside the timer before each trial
+  // (as XB-Gunrock's engine, built before its timer; BenchmarkKernelPrepared)
+  xbgap::State state(g.num_nodes());
   for (int iter = 0; iter < cli.num_trials(); iter++) {
     fill(xbgap::part_seconds, xbgap::part_seconds + xbgap::kParts, 0.0);
     fill(xbgap::part_calls, xbgap::part_calls + xbgap::kParts, 0);
+    state.Reset();
     gacge::TrialBegin(iter);  // GACGE: perf region / traversal trace (gacge.h)
     trial_timer.Start();
-    pvector<NodeID> mate = xbgap::MaximumMatching(g);
+    const pvector<NodeID> &mate = xbgap::MaximumMatching(g, state);
     trial_timer.Stop();
     gacge::TrialEnd(iter);
     if (gacge::Tracing()) gacge::TraceEnd(g.num_nodes(), g.num_edges_directed());

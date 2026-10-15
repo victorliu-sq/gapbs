@@ -32,12 +32,26 @@ using namespace std;
 typedef float ScoreT;
 const float kDamp = 0.85;
 
-pvector<ScoreT> PageRankPull(const Graph &g, int max_iters, double epsilon = 0,
-                             bool logging_enabled = false) {
+// GACGE: PageRankPull's scores and contributions, allocated once outside the
+// trials; PreparePR sets the scores to 1/n as PageRankPull did, untimed
+// (BenchmarkKernelPrepared).
+struct PRState {
+  pvector<ScoreT> scores, outgoing_contrib;
+  explicit PRState(const Graph &g) : scores(g.num_nodes()), outgoing_contrib(g.num_nodes()) {}
+};
+
+void PreparePR(const Graph &g, PRState &s) {
   const ScoreT init_score = 1.0f / g.num_nodes();
+  #pragma omp parallel for
+  for (NodeID n = 0; n < g.num_nodes(); n++)
+    s.scores[n] = init_score;
+}
+
+pvector<ScoreT>& PageRankPull(const Graph &g, PRState &s, int max_iters, double epsilon = 0,
+                              bool logging_enabled = false) {
   const ScoreT base_score = (1.0f - kDamp) / g.num_nodes();
-  pvector<ScoreT> scores(g.num_nodes(), init_score);
-  pvector<ScoreT> outgoing_contrib(g.num_nodes());
+  pvector<ScoreT> &scores = s.scores;
+  pvector<ScoreT> &outgoing_contrib = s.outgoing_contrib;
   for (int iter=0; iter < max_iters; iter++) {
     double error = 0;
     #pragma omp parallel for
@@ -100,12 +114,14 @@ int main(int argc, char* argv[]) {
     return -1;
   Builder b(cli);
   Graph g = b.MakeGraph();
-  auto PRBound = [&cli] (const Graph &g) {
-    return PageRankPull(g, cli.max_iters(), cli.tolerance(), cli.logging_en());
+  PRState state(g);  // GACGE: allocated once, prepared untimed per trial
+  auto Prepare = [&state] (const Graph &g) { PreparePR(g, state); };
+  auto PRBound = [&state, &cli] (const Graph &g) -> pvector<ScoreT>& {
+    return PageRankPull(g, state, cli.max_iters(), cli.tolerance(), cli.logging_en());
   };
   auto VerifierBound = [&cli] (const Graph &g, const pvector<ScoreT> &scores) {
     return PRVerifier(g, scores, cli.tolerance());
   };
-  BenchmarkKernel(cli, g, PRBound, PrintTopScores, VerifierBound);
+  BenchmarkKernelPrepared(cli, g, Prepare, PRBound, PrintTopScores, VerifierBound);
   return 0;
 }

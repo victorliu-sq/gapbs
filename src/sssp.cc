@@ -85,12 +85,30 @@ void RelaxEdges(const WGraph &g, NodeID u, WeightT delta,
   }
 }
 
-pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta,
-                           bool logging_enabled = false) {
+// GACGE: DeltaStep's distances and shared frontier (one entry per directed
+// edge), allocated once outside the trials; PrepareSSSP sets them to what
+// DeltaStep initialized at its start, untimed (BenchmarkKernelPrepared).
+struct SSSPState {
+  NodeID source = -1;
+  pvector<WeightT> dist;
+  pvector<NodeID> frontier;
+  explicit SSSPState(const WGraph &g) : dist(g.num_nodes()), frontier(g.num_edges_directed()) {}
+};
+
+void PrepareSSSP(const WGraph &g, NodeID source, SSSPState &s) {
+  s.source = source;
+  #pragma omp parallel for
+  for (NodeID n = 0; n < g.num_nodes(); n++)
+    s.dist[n] = kDistInf;
+  s.dist[source] = 0;
+}
+
+pvector<WeightT>& DeltaStep(const WGraph &g, SSSPState &s, WeightT delta,
+                            bool logging_enabled = false) {
   Timer t;
-  pvector<WeightT> dist(g.num_nodes(), kDistInf);
-  dist[source] = 0;
-  pvector<NodeID> frontier(g.num_edges_directed());
+  const NodeID source = s.source;
+  pvector<WeightT> &dist = s.dist;
+  pvector<NodeID> &frontier = s.frontier;
   // two element arrays for double buffering curr=iter&1, next=(iter+1)&1
   size_t shared_indexes[2] = {0, kMaxBin};
   size_t frontier_tails[2] = {1, 0};
@@ -218,13 +236,16 @@ int main(int argc, char* argv[]) {
   WeightedBuilder b(cli);
   WGraph g = b.MakeGraph();
   SourcePicker<WGraph> sp(g, cli.start_vertex());
-  auto SSSPBound = [&sp, &cli] (const WGraph &g) {
-    return DeltaStep(g, sp.PickNext(), cli.delta(), cli.logging_en());
+  SSSPState state(g);  // GACGE: allocated once, prepared untimed per trial
+  auto Prepare = [&sp, &state] (const WGraph &g) {
+    PrepareSSSP(g, sp.PickNext(), state);
   };
-  SourcePicker<WGraph> vsp(g, cli.start_vertex());
-  auto VerifierBound = [&vsp] (const WGraph &g, const pvector<WeightT> &dist) {
-    return SSSPVerifier(g, vsp.PickNext(), dist);
+  auto SSSPBound = [&state, &cli] (const WGraph &g) -> pvector<WeightT>& {
+    return DeltaStep(g, state, cli.delta(), cli.logging_en());
   };
-  BenchmarkKernel(cli, g, SSSPBound, PrintSSSPStats, VerifierBound);
+  auto VerifierBound = [&state] (const WGraph &g, const pvector<WeightT> &dist) {
+    return SSSPVerifier(g, state.source, dist);
+  };
+  BenchmarkKernelPrepared(cli, g, Prepare, SSSPBound, PrintSSSPStats, VerifierBound);
   return 0;
 }

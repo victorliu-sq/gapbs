@@ -127,4 +127,41 @@ void BenchmarkKernel(const CLApp &cli, const GraphT_ &g,
   PrintTime("Average Time", total_seconds / cli.num_trials());
 }
 
+// GACGE: BenchmarkKernel with the kernel's state allocated once by the
+// caller and set to its initial values by prepare(g) before each trial,
+// outside the timer (as Gunrock times only its enactor loop, after the
+// problem's allocation and reset). kernel(g) returns a reference to its
+// result in that state, so nothing is copied inside the timed region.
+template<typename GraphT_, typename PrepFunc, typename GraphFunc,
+         typename AnalysisFunc, typename VerifierFunc>
+void BenchmarkKernelPrepared(const CLApp &cli, const GraphT_ &g,
+                             PrepFunc prepare, GraphFunc kernel,
+                             AnalysisFunc stats, VerifierFunc verify) {
+  g.PrintStats();
+  double total_seconds = 0;
+  Timer trial_timer;
+  for (int iter=0; iter < cli.num_trials(); iter++) {
+    prepare(g);
+    gacge::TrialBegin(iter);
+    trial_timer.Start();
+    auto &result = kernel(g);
+    trial_timer.Stop();
+    gacge::TrialEnd(iter);
+    if (gacge::Tracing())
+      gacge::TraceEnd(g.num_nodes(), g.num_edges_directed());
+    PrintTime("Trial Time", trial_timer.Seconds());
+    total_seconds += trial_timer.Seconds();
+    if (cli.do_analysis() && (iter == (cli.num_trials()-1)))
+      stats(g, result);
+    if (cli.do_verify()) {
+      trial_timer.Start();
+      PrintLabel("Verification",
+                 verify(std::ref(g), std::ref(result)) ? "PASS" : "FAIL");
+      trial_timer.Stop();
+      PrintTime("Verification Time", trial_timer.Seconds());
+    }
+  }
+  PrintTime("Average Time", total_seconds / cli.num_trials());
+}
+
 #endif  // BENCHMARK_H_

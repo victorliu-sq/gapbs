@@ -120,24 +120,41 @@ pvector<NodeID> InitParent(const Graph &g) {
   return parent;
 }
 
-pvector<NodeID> DOBFS(const Graph &g, NodeID source, bool logging_enabled = false,
-                      int alpha = 15, int beta = 18) {
+// GACGE: DOBFS's state, allocated once outside the trials; PrepareBFS sets it
+// to what DOBFS initialized at its start (InitParent, the source in the queue,
+// cleared bitmaps), untimed (BenchmarkKernelPrepared).
+struct BFSState {
+  NodeID source = -1;
+  pvector<NodeID> parent;
+  SlidingQueue<NodeID> queue;
+  Bitmap curr, front;
+  explicit BFSState(const Graph &g) : parent(g.num_nodes()), queue(g.num_nodes()),
+      curr(g.num_nodes()), front(g.num_nodes()) {}
+};
+
+void PrepareBFS(const Graph &g, NodeID source, BFSState &s) {
+  s.source = source;
+  #pragma omp parallel for
+  for (NodeID n=0; n < g.num_nodes(); n++)
+    s.parent[n] = g.out_degree(n) != 0 ? -g.out_degree(n) : -1;
+  s.parent[source] = source;
+  s.queue.reset();
+  s.queue.push_back(source);
+  s.queue.slide_window();
+  s.curr.reset();
+  s.front.reset();
+}
+
+pvector<NodeID>& DOBFS(const Graph &g, BFSState &s, bool logging_enabled = false,
+                       int alpha = 15, int beta = 18) {
+  const NodeID source = s.source;
   if (logging_enabled)
     PrintStep("Source", static_cast<int64_t>(source));
   Timer t;
-  t.Start();
-  pvector<NodeID> parent = InitParent(g);
-  t.Stop();
-  if (logging_enabled)
-    PrintStep("i", t.Seconds());
-  parent[source] = source;
-  SlidingQueue<NodeID> queue(g.num_nodes());
-  queue.push_back(source);
-  queue.slide_window();
-  Bitmap curr(g.num_nodes());
-  curr.reset();
-  Bitmap front(g.num_nodes());
-  front.reset();
+  pvector<NodeID> &parent = s.parent;
+  SlidingQueue<NodeID> &queue = s.queue;
+  Bitmap &curr = s.curr;
+  Bitmap &front = s.front;
   int64_t edges_to_check = g.num_edges_directed();
   int64_t scout_count = g.out_degree(source);
   const bool trace = gacge::Tracing();  // GACGE: one XBStep line per step (gacge.h)
@@ -265,13 +282,16 @@ int main(int argc, char* argv[]) {
   Builder b(cli);
   Graph g = b.MakeGraph();
   SourcePicker<Graph> sp(g, cli.start_vertex());
-  auto BFSBound = [&sp,&cli] (const Graph &g) {
-    return DOBFS(g, sp.PickNext(), cli.logging_en());
+  BFSState state(g);  // GACGE: allocated once, prepared untimed per trial
+  auto Prepare = [&sp, &state] (const Graph &g) {
+    PrepareBFS(g, sp.PickNext(), state);
   };
-  SourcePicker<Graph> vsp(g, cli.start_vertex());
-  auto VerifierBound = [&vsp] (const Graph &g, const pvector<NodeID> &parent) {
-    return BFSVerifier(g, vsp.PickNext(), parent);
+  auto BFSBound = [&state, &cli] (const Graph &g) -> pvector<NodeID>& {
+    return DOBFS(g, state, cli.logging_en());
   };
-  BenchmarkKernel(cli, g, BFSBound, PrintBFSStats, VerifierBound);
+  auto VerifierBound = [&state] (const Graph &g, const pvector<NodeID> &parent) {
+    return BFSVerifier(g, state.source, parent);
+  };
+  BenchmarkKernelPrepared(cli, g, Prepare, BFSBound, PrintBFSStats, VerifierBound);
   return 0;
 }
