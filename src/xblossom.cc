@@ -95,9 +95,15 @@ struct NoInitAlloc : std::allocator<T> {
 };
 typedef vector<NodeID, NoInitAlloc<NodeID>> Frontier;
 
-// GACGE_XB_PHASES=1: seconds spent in each part of a matching (XBPhases line
-// per trial); off by default.
-const bool kPhases = getenv("GACGE_XB_PHASES") != nullptr;
+// Seconds spent in each part of a matching, one XBPhases line per trial (two
+// omp_get_wtime calls per part and step); GACGE_XB_PHASES=0 turns it off. The
+// line gives the parts and, under the names XB-Gunrock prints, the three
+// phases: aug_path_s = augment + flip, expand_s, blossom_s = blossom + apply,
+// and init_s = reset (the forest rebuilt at the start of a search).
+const bool kPhases = [] {
+  const char *e = getenv("GACGE_XB_PHASES");
+  return e == nullptr || e[0] != '0';
+}();
 enum Part { kReset, kAugment, kExpand, kBlossom, kApply, kFlip, kParts };
 const char *kPartNames[kParts] = {"reset", "augment", "expand", "blossom", "apply", "flip"};
 double part_seconds[kParts];
@@ -555,10 +561,12 @@ int main(int argc, char* argv[]) {
     printf("XBRound: index=%d runtime_s=%.9f matching_size=%" PRId64 " valid=%d\n", iter,
            trial_timer.Seconds(), size, valid ? 1 : 0);
     if (xbgap::kPhases) {
-      printf("XBPhases: index=%d", iter);
-      for (int p = 0; p < xbgap::kParts; p++)
-        printf(" %s_s=%.6f %s_calls=%" PRId64, xbgap::kPartNames[p], xbgap::part_seconds[p],
-               xbgap::kPartNames[p], xbgap::part_calls[p]);
+      using namespace xbgap;
+      const double *ps = part_seconds;
+      printf("XBPhases: index=%d aug_path_s=%.9f expand_s=%.9f blossom_s=%.9f init_s=%.9f steps=%" PRId64, iter,
+             ps[kAugment] + ps[kFlip], ps[kExpand], ps[kBlossom] + ps[kApply], ps[kReset], part_calls[kExpand]);
+      for (int p = 0; p < kParts; p++)
+        printf(" %s_s=%.9f %s_calls=%" PRId64, kPartNames[p], ps[p], kPartNames[p], part_calls[p]);
       printf("\n");
     }
     fflush(stdout);
