@@ -16,6 +16,7 @@
 #include "benchmark.h"
 #include "builder.h"
 #include "command_line.h"
+#include "gacge.h"
 #include "graph.h"
 #include "platform_atomics.h"
 #include "pvector.h"
@@ -244,6 +245,7 @@ void FlipRoute(State &S, NodeID x) {
 
 // 1. Augmenting edges.
 struct Augment {
+  static constexpr const char *kPhase = "augment";
   State &S;
   bool cond(NodeID w) const { return S.is_even[w]; }
   void update(NodeID v, NodeID w) {
@@ -265,6 +267,7 @@ struct Augment {
 
 // 2. Expansion: w (in no tree) becomes odd, its mate x even.
 struct Expand {
+  static constexpr const char *kPhase = "expand";
   State &S;
   bool cond(NodeID w) const { return S.belongs[w] == -1; }
   void update(NodeID v, NodeID w) {
@@ -281,6 +284,7 @@ struct Expand {
 
 // 3. Blossoms: a closing edge claims the odd vertices on both chains.
 struct Blossom {
+  static constexpr const char *kPhase = "blossom";
   State &S;
   bool cond(NodeID w) const { return S.is_even[w]; }
   void update(NodeID v, NodeID w) {
@@ -310,6 +314,12 @@ template <typename F>
 void Step(const Graph &g, State &S, const Frontier &frontier, F f) {
   const int64_t m = frontier.size();
   if (m == 0) return;
+  if (gacge::Tracing()) {  // GACGE: one XBStep line per step (gacge.h)
+    int64_t fe = 0;
+    #pragma omp parallel for reduction(+ : fe)
+    for (int64_t i = 0; i < m; i++) fe += g.out_degree(frontier[i]);
+    gacge::TraceStep(F::kPhase, "push", m, fe);
+  }
   if (m < kParallelMin) {
     bool split = false;
     for (int64_t i = 0; i < m && !split; i++) split = g.out_degree(frontier[i]) > kSplitDegree;
@@ -529,9 +539,12 @@ int main(int argc, char* argv[]) {
   for (int iter = 0; iter < cli.num_trials(); iter++) {
     fill(xbgap::part_seconds, xbgap::part_seconds + xbgap::kParts, 0.0);
     fill(xbgap::part_calls, xbgap::part_calls + xbgap::kParts, 0);
+    gacge::TrialBegin(iter);  // GACGE: perf region / traversal trace (gacge.h)
     trial_timer.Start();
     pvector<NodeID> mate = xbgap::MaximumMatching(g);
     trial_timer.Stop();
+    gacge::TrialEnd(iter);
+    if (gacge::Tracing()) gacge::TraceEnd(g.num_nodes(), g.num_edges_directed());
     PrintTime("Trial Time", trial_timer.Seconds());
     total_seconds += trial_timer.Seconds();
     const int64_t size = xbgap::CheckMatching(g, mate);

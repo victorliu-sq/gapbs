@@ -8,6 +8,7 @@
 #include "bitmap.h"
 #include "builder.h"
 #include "command_line.h"
+#include "gacge.h"
 #include "graph.h"
 #include "platform_atomics.h"
 #include "pvector.h"
@@ -139,6 +140,7 @@ pvector<NodeID> DOBFS(const Graph &g, NodeID source, bool logging_enabled = fals
   front.reset();
   int64_t edges_to_check = g.num_edges_directed();
   int64_t scout_count = g.out_degree(source);
+  const bool trace = gacge::Tracing();  // GACGE: one XBStep line per step (gacge.h)
   while (!queue.empty()) {
     if (scout_count > edges_to_check / alpha) {
       int64_t awake_count, old_awake_count;
@@ -148,6 +150,13 @@ pvector<NodeID> DOBFS(const Graph &g, NodeID source, bool logging_enabled = fals
       awake_count = queue.size();
       queue.slide_window();
       do {
+        if (trace) {
+          int64_t fe = 0;
+          #pragma omp parallel for reduction(+ : fe)
+          for (NodeID u = 0; u < g.num_nodes(); u++)
+            if (front.get_bit(u)) fe += g.out_degree(u);
+          gacge::TraceStep("bu", "pull", awake_count, fe);
+        }
         t.Start();
         old_awake_count = awake_count;
         awake_count = BUStep(g, parent, front, curr);
@@ -162,6 +171,8 @@ pvector<NodeID> DOBFS(const Graph &g, NodeID source, bool logging_enabled = fals
         PrintStep("c", t.Seconds());
       scout_count = 1;
     } else {
+      if (trace)
+        gacge::TraceStep("td", "push", queue.size(), scout_count);
       t.Start();
       edges_to_check -= scout_count;
       scout_count = TDStep(g, parent, queue);

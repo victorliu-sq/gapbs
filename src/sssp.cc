@@ -10,6 +10,7 @@
 #include "benchmark.h"
 #include "builder.h"
 #include "command_line.h"
+#include "gacge.h"
 #include "graph.h"
 #include "platform_atomics.h"
 #include "pvector.h"
@@ -94,6 +95,7 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta,
   size_t shared_indexes[2] = {0, kMaxBin};
   size_t frontier_tails[2] = {1, 0};
   frontier[0] = source;
+  const bool trace = gacge::Tracing();  // GACGE: one XBStep line per bin iteration (gacge.h)
   t.Start();
   #pragma omp parallel
   {
@@ -104,6 +106,21 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta,
       size_t &next_bin_index = shared_indexes[(iter+1)&1];
       size_t &curr_frontier_tail = frontier_tails[iter&1];
       size_t &next_frontier_tail = frontier_tails[(iter+1)&1];
+      if (trace) {
+        // the frontier entries this iteration relaxes (stale ones are skipped)
+        #pragma omp single
+        {
+          int64_t fv = 0, fe = 0;
+          for (size_t i = 0; i < curr_frontier_tail; i++) {
+            NodeID u = frontier[i];
+            if (dist[u] >= delta * static_cast<WeightT>(curr_bin_index)) {
+              fv++;
+              fe += g.out_degree(u);
+            }
+          }
+          gacge::TraceStep("bin", "push", fv, fe);
+        }
+      }
       #pragma omp for nowait schedule(dynamic, 64)
       for (size_t i=0; i < curr_frontier_tail; i++) {
         NodeID u = frontier[i];

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "builder.h"
+#include "gacge.h"
 #include "graph.h"
 #include "timer.h"
 #include "util.h"
@@ -104,9 +105,13 @@ void BenchmarkKernel(const CLApp &cli, const GraphT_ &g,
   double total_seconds = 0;
   Timer trial_timer;
   for (int iter=0; iter < cli.num_trials(); iter++) {
+    gacge::TrialBegin(iter);  // GACGE: perf region / traversal trace (gacge.h)
     trial_timer.Start();
     auto result = kernel(g);
     trial_timer.Stop();
+    gacge::TrialEnd(iter);
+    if (gacge::Tracing())
+      gacge::TraceEnd(g.num_nodes(), g.num_edges_directed());
     PrintTime("Trial Time", trial_timer.Seconds());
     total_seconds += trial_timer.Seconds();
     if (cli.do_analysis() && (iter == (cli.num_trials()-1)))
