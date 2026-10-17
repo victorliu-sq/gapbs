@@ -7,7 +7,9 @@
 // the counters run only inside the trials, from just before a trial's kernel to
 // just after it, so reading, building and converting the graph and verifying
 // the result are not counted. GACGE_PERF_SKIP=<k> leaves the first k trials
-// uncounted (warm-up; default 0).
+// uncounted (warm-up; default 0). GACGE_PERF_PHASE=<name> counts only inside
+// that phase of the counted trials (PerfPhase regions: X-Blossom's augment,
+// expand, blossom; BFS's td, bu) instead of the whole kernel.
 //
 // traversal trace (GACGE_TRAVERSAL_TRACE=<trial>): one XBStep line per step of
 // that trial (0-based) and an XBTraversal line after it, in the format of the
@@ -60,16 +62,38 @@ inline PerfCtl &perf() {
   return p;
 }
 
-// Around one trial's kernel (the region GAP times).
+inline const char *PerfPhase() {
+  static const char *ph = getenv("GACGE_PERF_PHASE");
+  return ph;
+}
+
+// Around one trial's kernel (the region GAP times); with GACGE_PERF_PHASE the
+// counters run only inside that phase's PerfPhase regions instead.
 inline void TrialBegin(int t) {
   trial() = t;
   PerfCtl &p = perf();
-  if (p.ctl >= 0 && t >= p.skip) p.Send("enable\n");
+  if (p.ctl >= 0 && t >= p.skip && PerfPhase() == nullptr) p.Send("enable\n");
 }
 inline void TrialEnd(int t) {
   PerfCtl &p = perf();
-  if (p.ctl >= 0 && t >= p.skip) p.Send("disable\n");
+  if (p.ctl >= 0 && t >= p.skip && PerfPhase() == nullptr) p.Send("disable\n");
 }
+
+// A scope of one phase of a trial: counted when GACGE_PERF_PHASE names it.
+struct PerfPhaseRegion {
+  bool on = false;
+  explicit PerfPhaseRegion(const char *name) {
+    const char *ph = PerfPhase();
+    PerfCtl &p = perf();
+    if (ph != nullptr && p.ctl >= 0 && trial() >= p.skip && strcmp(ph, name) == 0) {
+      p.Send("enable\n");
+      on = true;
+    }
+  }
+  ~PerfPhaseRegion() {
+    if (on) perf().Send("disable\n");
+  }
+};
 
 // ---- traversal trace ------------------------------------------------------------
 inline int TraceTrial() {

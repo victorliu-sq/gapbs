@@ -447,14 +447,15 @@ void SearchPhase(const Graph &g, State &S) {
   Concat(frontier, v1, v2);
   delete reset;
   while (true) {
-    { PartTimer t(kAugment); Step(g, S, frontier, Augment{S}); }
+    { PartTimer t(kAugment); gacge::PerfPhaseRegion r("augment"); Step(g, S, frontier, Augment{S}); }
     if (S.have_paths()) return;
     // expand from every even vertex of the frontier: v1 = the new even vertices
-    { PartTimer t(kExpand); Step(g, S, frontier, Expand{S}); Gather(S.out, v1); }
+    { PartTimer t(kExpand); gacge::PerfPhaseRegion r("expand"); Step(g, S, frontier, Expand{S}); Gather(S.out, v1); }
     // blossoms from the new even vertices and the previous blossom step's
-    { PartTimer t(kBlossom); Concat(blossom_frontier, v1, v2); Step(g, S, blossom_frontier, Blossom{S}); }
+    { PartTimer t(kBlossom); gacge::PerfPhaseRegion r("blossom"); Concat(blossom_frontier, v1, v2); Step(g, S, blossom_frontier, Blossom{S}); }
     // the claimed odd vertices become even around their blossoms
     PartTimer apply(kApply);
+    gacge::PerfPhaseRegion apply_r("blossom");  // the blossom phase: blossom + apply (XBPhases' blossom_s)
     Frontier &tk = S.tk;
     Gather(S.tasks, tk);
     const int64_t nt = tk.size() / 4;
@@ -487,6 +488,7 @@ pvector<NodeID>& MaximumMatching(const Graph &g, State &S) {
     if (!S.have_paths()) break;
     // each augmenting edge (v, w) owns its two trees: the flips do not overlap
     PartTimer t(kFlip);
+    gacge::PerfPhaseRegion r("augment");  // the augment phase: augment + flip (XBPhases' aug_path_s)
     Frontier &ap = S.ap;
     Gather(S.aug_pairs, ap);
     const int64_t np = ap.size() / 2;

@@ -176,7 +176,10 @@ pvector<NodeID>& DOBFS(const Graph &g, BFSState &s, bool logging_enabled = false
         }
         t.Start();
         old_awake_count = awake_count;
-        awake_count = BUStep(g, parent, front, curr);
+        {
+          gacge::PerfPhaseRegion r("bu");  // GACGE: GACGE_PERF_PHASE=bu counts the bottom-up steps
+          awake_count = BUStep(g, parent, front, curr);
+        }
         front.swap(curr);
         t.Stop();
         if (logging_enabled)
@@ -192,7 +195,10 @@ pvector<NodeID>& DOBFS(const Graph &g, BFSState &s, bool logging_enabled = false
         gacge::TraceStep("td", "push", queue.size(), scout_count);
       t.Start();
       edges_to_check -= scout_count;
-      scout_count = TDStep(g, parent, queue);
+      {
+        gacge::PerfPhaseRegion r("td");  // GACGE: GACGE_PERF_PHASE=td counts the top-down steps
+        scout_count = TDStep(g, parent, queue);
+      }
       queue.slide_window();
       t.Stop();
       if (logging_enabled)
