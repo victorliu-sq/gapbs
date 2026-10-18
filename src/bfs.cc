@@ -321,7 +321,10 @@ int main(int argc, char* argv[]) {
     PrepareBFS(g, sp.PickNext(), state);
   };
   auto BFSBound = [&state, &cli] (const Graph &g) -> pvector<NodeID>& {
-    return DOBFS(g, state, cli.logging_en());
+    // GACGE: GACGE_BFS_ALPHA / GACGE_BFS_BETA override GAP's switching thresholds (15, 18)
+    static const int alpha = getenv("GACGE_BFS_ALPHA") ? atoi(getenv("GACGE_BFS_ALPHA")) : 15;
+    static const int beta = getenv("GACGE_BFS_BETA") ? atoi(getenv("GACGE_BFS_BETA")) : 18;
+    return DOBFS(g, state, cli.logging_en(), alpha, beta);
   };
   auto VerifierBound = [&state] (const Graph &g, const pvector<NodeID> &parent) {
     return BFSVerifier(g, state.source, parent);

@@ -64,7 +64,8 @@ using namespace std;
 
 const WeightT kDistInf = numeric_limits<WeightT>::max()/2;
 const size_t kMaxBin = numeric_limits<size_t>::max()/2;
-const size_t kBinSizeThreshold = 1000;
+// GACGE: GACGE_SSSP_FUSE overrides GAP's bin-fusion threshold (1000 entries)
+const size_t kBinSizeThreshold = getenv("GACGE_SSSP_FUSE") ? strtoull(getenv("GACGE_SSSP_FUSE"), nullptr, 10) : 1000;
 
 inline
 void RelaxEdges(const WGraph &g, NodeID u, WeightT delta,
