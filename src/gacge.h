@@ -145,7 +145,11 @@ inline void TraceEnd(int64_t nodes, int64_t edges) {
 // then the barrier. Summed per region r (0-7) over a trial; after each counted
 // trial (GACGE_SYNC_SKIP=<k>, default 1: the warm-up left out) one line per region:
 //   XBSync: trial=<t> region=<name> loops=<k> threads=<P> span_s=<sum of spans>
-//           busy_s=<sum of busy> util=<busy / (P x span)>
+//           busy_s=<sum of busy> wait_s=<sum of waits at the barrier> skew_s=<sum of late
+//           entries> idle_s=<one-thread steps: the others' time> util=<busy / (P x span)>
+// (P x span = busy + wait + skew: a thread's busy time, its wait at the barrier for the
+// slowest, and how much later than the first it entered the loop; + idle for the
+// GACGE_SYNC_SERIAL steps.)
 // GACGE_SYNC_SERIAL(r, name, s) adds s seconds of work on one thread while the others
 // idle (busy s, span s), e.g. XB-GAP's small frontiers.
 #ifndef GACGE_SYNC_STATS_BUILD
@@ -159,7 +163,7 @@ namespace gacge {
 namespace sync {
 constexpr int kRegions = 8, kThreads = 512;
 struct alignas(64) Slot { double begin = 0, end = 0; };
-struct Acc { const char *name = nullptr; int64_t loops = 0; int threads = 0; double span = 0, busy = 0; };
+struct Acc { const char *name = nullptr; int64_t loops = 0; int threads = 0; double span = 0, busy = 0, wait = 0, skew = 0, idle = 0; };
 inline Slot (&slots())[kRegions][kThreads] { static Slot s[kRegions][kThreads]; return s; }
 inline Acc (&acc())[kRegions] { static Acc a[kRegions]; return a; }
 inline bool On() {
@@ -176,11 +180,15 @@ inline void End(int r) { if (Counted()) slots()[r][omp_get_thread_num()].end = o
 inline void Fold(int r, const char *name) {
   if (!Counted()) return;
   const int P = omp_get_num_threads();
-  double b = slots()[r][0].begin, e = slots()[r][0].end, busy = 0;
+  double b = slots()[r][0].begin, e = slots()[r][0].end, busy = 0, wait = 0, skew = 0;
   for (int t = 0; t < P; t++) {
     b = std::min(b, slots()[r][t].begin);
     e = std::max(e, slots()[r][t].end);
+  }
+  for (int t = 0; t < P; t++) {  // span = busy + wait (at the barrier) + skew (entering late), per thread
     busy += slots()[r][t].end - slots()[r][t].begin;
+    wait += e - slots()[r][t].end;
+    skew += slots()[r][t].begin - b;
   }
   Acc &a = acc()[r];
   a.name = name;
@@ -188,6 +196,8 @@ inline void Fold(int r, const char *name) {
   a.threads = std::max(a.threads, P);
   a.span += e - b;
   a.busy += busy;
+  a.wait += wait;
+  a.skew += skew;
 }
 inline void Serial(int r, const char *name, double s) {
   if (!Counted()) return;
@@ -197,13 +207,15 @@ inline void Serial(int r, const char *name, double s) {
   a.threads = std::max(a.threads, omp_get_max_threads());
   a.span += s;
   a.busy += s;
+  a.idle += (omp_get_max_threads() - 1) * s;  // the other threads, with nothing to do
 }
 inline void Report() {
   if (!Counted()) return;
   for (Acc &a : acc()) {
     if (a.loops)
-      printf("XBSync: trial=%d region=%s loops=%" PRId64 " threads=%d span_s=%.9f busy_s=%.9f util=%.4f\n", trial(),
-             a.name, a.loops, a.threads, a.span, a.busy, a.span > 0 ? a.busy / (a.threads * a.span) : 0.0);
+      printf("XBSync: trial=%d region=%s loops=%" PRId64 " threads=%d span_s=%.9f busy_s=%.9f wait_s=%.9f"
+             " skew_s=%.9f idle_s=%.9f util=%.4f\n", trial(), a.name, a.loops, a.threads, a.span, a.busy, a.wait, a.skew, a.idle,
+             a.span > 0 ? a.busy / (a.threads * a.span) : 0.0);
     a = Acc();
   }
   fflush(stdout);
