@@ -47,6 +47,14 @@ void PreparePR(const Graph &g, PRState &s) {
     s.scores[n] = init_score;
 }
 
+// GAP's pull chunk: 16384 vertices. The sync-stats build (an experiment only) takes
+// GACGE_PR_CHUNK=<vertices> instead.
+#if GACGE_SYNC_STATS_BUILD
+static const int kPullChunk = getenv("GACGE_PR_CHUNK") ? atoi(getenv("GACGE_PR_CHUNK")) : 16384;
+#else
+static const int kPullChunk = 16384;
+#endif
+
 pvector<ScoreT>& PageRankPull(const Graph &g, PRState &s, int max_iters, double epsilon = 0,
                               bool logging_enabled = false) {
   const ScoreT base_score = (1.0f - kDamp) / g.num_nodes();
@@ -60,7 +68,7 @@ pvector<ScoreT>& PageRankPull(const Graph &g, PRState &s, int max_iters, double 
     #pragma omp parallel
     {
       GACGE_SYNC_BEGIN(0);  // GACGE: barrier wait (gacge.h sync stats)
-      #pragma omp for reduction(+ : error) schedule(dynamic, 16384) GACGE_NOWAIT
+      #pragma omp for reduction(+ : error) schedule(dynamic, kPullChunk) GACGE_NOWAIT
       for (NodeID u=0; u < g.num_nodes(); u++) {
         ScoreT incoming_total = 0;
         for (NodeID v : g.in_neigh(u))

@@ -70,6 +70,23 @@ int64_t BUStep(const Graph &g, pvector<NodeID> &parent, Bitmap &front,
 }
 
 
+// GAP's top-down step splits the queue statically. The sync-stats build (an experiment
+// only) runs it under schedule(runtime): static by default, GACGE_BFS_TD_SCHED=dynamic[,<chunk>]
+// for a dynamic schedule.
+#if GACGE_SYNC_STATS_BUILD
+static const bool kTDSched = [] {
+  const char *e = getenv("GACGE_BFS_TD_SCHED");
+  int chunk = 0;
+  if (e != nullptr && strncmp(e, "dynamic", 7) == 0) {
+    if (e[7] == ',') chunk = atoi(e + 8);
+    omp_set_schedule(omp_sched_dynamic, chunk > 0 ? chunk : 1);
+  } else {
+    omp_set_schedule(omp_sched_static, 0);
+  }
+  return true;
+}();
+#endif
+
 int64_t TDStep(const Graph &g, pvector<NodeID> &parent,
                SlidingQueue<NodeID> &queue) {
   int64_t scout_count = 0;
@@ -77,7 +94,11 @@ int64_t TDStep(const Graph &g, pvector<NodeID> &parent,
   {
     GACGE_SYNC_BEGIN(0);  // GACGE: barrier wait (gacge.h sync stats)
     QueueBuffer<NodeID> lqueue(queue);
+#if GACGE_SYNC_STATS_BUILD
+    #pragma omp for reduction(+ : scout_count) nowait schedule(runtime)
+#else
     #pragma omp for reduction(+ : scout_count) nowait
+#endif
     for (auto q_iter = queue.begin(); q_iter < queue.end(); q_iter++) {
       NodeID u = *q_iter;
       for (NodeID v : g.out_neigh(u)) {

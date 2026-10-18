@@ -142,13 +142,22 @@ pvector<WeightT>& DeltaStep(const WGraph &g, SSSPState &s, WeightT delta,
           gacge::TraceStep("bin", "push", fv, fe);
         }
       }
-      GACGE_SYNC_BEGIN(0);  // GACGE: barrier wait (gacge.h sync stats): the bin's relaxations and fusion
+      // GACGE: barrier wait (gacge.h sync stats): the bin's relaxations (to the mark) and the thread's local
+      // fusion; region 1: bins of fewer entries than 64 (the chunk) x the threads, region 0 the others
+#if GACGE_SYNC_STATS_BUILD
+      const int sync_r = curr_frontier_tail < 64 * static_cast<size_t>(omp_get_num_threads()) ? 1 : 0;
+#else
+      const int sync_r = 0;
+#endif
+      (void)sync_r;
+      GACGE_SYNC_BEGIN(sync_r);
       #pragma omp for nowait schedule(dynamic, 64)
       for (size_t i=0; i < curr_frontier_tail; i++) {
         NodeID u = frontier[i];
         if (dist[u] >= delta * static_cast<WeightT>(curr_bin_index))
           RelaxEdges(g, u, delta, dist, local_bins, trace);
       }
+      GACGE_SYNC_MARK(sync_r);
       while (curr_bin_index < local_bins.size() &&
              !local_bins[curr_bin_index].empty() &&
              local_bins[curr_bin_index].size() < kBinSizeThreshold) {
@@ -164,7 +173,7 @@ pvector<WeightT>& DeltaStep(const WGraph &g, SSSPState &s, WeightT delta,
           break;
         }
       }
-      GACGE_SYNC_END(0, "bin");
+      GACGE_SYNC_END(sync_r, sync_r ? "bin_small" : "bin");
       #pragma omp barrier
       #pragma omp single nowait
       {
