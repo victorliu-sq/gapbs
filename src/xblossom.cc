@@ -340,27 +340,38 @@ void Step(const Graph &g, State &S, const Frontier &frontier, F f) {
     for (int64_t i = 0; i < m; i++) fe += g.out_degree(frontier[i]);
     gacge::TraceStep(F::kPhase, "push", m, fe);
   }
+  // GACGE: barrier wait per phase (gacge.h sync stats): region 0 augment, 1 expand, 2 blossom
+  constexpr int kSync = F::kPhase[0] == 'a' ? 0 : F::kPhase[0] == 'e' ? 1 : 2;
+  (void)kSync;
   if (m < kParallelMin) {
     bool split = false;
     for (int64_t i = 0; i < m && !split; i++) split = g.out_degree(frontier[i]) > kSplitDegree;
     if (!split) {
+#if GACGE_SYNC_STATS_BUILD
+      const double t0 = omp_get_wtime();
+#endif
       for (int64_t i = 0; i < m; i++) {
         const NodeID v = frontier[i];
         ScanEdges(g.out_neigh(v).begin(), 0, g.out_degree(v), v, f);
       }
+#if GACGE_SYNC_STATS_BUILD
+      GACGE_SYNC_SERIAL(kSync, F::kPhase, omp_get_wtime() - t0);
+#endif
       return;
     }
   }
   #pragma omp parallel
   {
+    GACGE_SYNC_BEGIN(kSync);
     vector<NodeID> &hv = S.heavy[omp_get_thread_num()];
-    #pragma omp for schedule(dynamic, 64)
+    #pragma omp for schedule(dynamic, 64) GACGE_NOWAIT
     for (int64_t i = 0; i < m; i++) {
       const NodeID v = frontier[i];
       const int64_t d = g.out_degree(v);
       if (d > kSplitDegree) hv.push_back(v);
       else ScanEdges(g.out_neigh(v).begin(), 0, d, v, f);
     }
+    GACGE_SYNC_END(kSync, F::kPhase);
     #pragma omp single
     {
       S.chunks.clear();
@@ -371,12 +382,14 @@ void Step(const Graph &g, State &S, const Frontier &frontier, F f) {
       }
     }
     const int64_t nc = S.chunks.size();
-    #pragma omp for schedule(dynamic, 1)
+    GACGE_SYNC_BEGIN(kSync);
+    #pragma omp for schedule(dynamic, 1) GACGE_NOWAIT
     for (int64_t c = 0; c < nc; c++) {
       const NodeID v = S.chunks[c].first;
       const int64_t b = S.chunks[c].second, e = min(b + kSplitGrain, g.out_degree(v));
       ScanEdges(g.out_neigh(v).begin(), b, e, v, f);
     }
+    if (nc) GACGE_SYNC_END(kSync, F::kPhase);
   }
 }
 
@@ -579,6 +592,7 @@ int main(int argc, char* argv[]) {
     const pvector<NodeID> &mate = xbgap::MaximumMatching(g, state);
     trial_timer.Stop();
     gacge::TrialEnd(iter);
+    GACGE_SYNC_REPORT();
     if (gacge::Tracing()) gacge::TraceEnd(g.num_nodes(), g.num_edges_directed());
     PrintTime("Trial Time", trial_timer.Seconds());
     total_seconds += trial_timer.Seconds();

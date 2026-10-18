@@ -51,21 +51,26 @@ using namespace std;
 
 size_t OrderedCount(const Graph &g) {
   size_t total = 0;
-  #pragma omp parallel for reduction(+ : total) schedule(dynamic, 64)
-  for (NodeID u=0; u < g.num_nodes(); u++) {
-    for (NodeID v : g.out_neigh(u)) {
-      if (v > u)
-        break;
-      auto it = g.out_neigh(v).begin();
-      for (NodeID w : g.out_neigh(u)) {
-        if (w > v)
+  #pragma omp parallel
+  {
+    GACGE_SYNC_BEGIN(0);  // GACGE: barrier wait (gacge.h sync stats)
+    #pragma omp for reduction(+ : total) schedule(dynamic, 64) GACGE_NOWAIT
+    for (NodeID u=0; u < g.num_nodes(); u++) {
+      for (NodeID v : g.out_neigh(u)) {
+        if (v > u)
           break;
-        while (*it < w)
-          it++;
-        if (w == *it)
-          total++;
+        auto it = g.out_neigh(v).begin();
+        for (NodeID w : g.out_neigh(u)) {
+          if (w > v)
+            break;
+          while (*it < w)
+            it++;
+          if (w == *it)
+            total++;
+        }
       }
     }
+    GACGE_SYNC_END(0, "tc");
   }
   return total;
 }

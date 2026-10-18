@@ -142,6 +142,7 @@ pvector<WeightT>& DeltaStep(const WGraph &g, SSSPState &s, WeightT delta,
           gacge::TraceStep("bin", "push", fv, fe);
         }
       }
+      GACGE_SYNC_BEGIN(0);  // GACGE: barrier wait (gacge.h sync stats): the bin's relaxations and fusion
       #pragma omp for nowait schedule(dynamic, 64)
       for (size_t i=0; i < curr_frontier_tail; i++) {
         NodeID u = frontier[i];
@@ -163,6 +164,7 @@ pvector<WeightT>& DeltaStep(const WGraph &g, SSSPState &s, WeightT delta,
           break;
         }
       }
+      GACGE_SYNC_END(0, "bin");
       #pragma omp barrier
       #pragma omp single nowait
       {

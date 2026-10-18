@@ -110,6 +110,7 @@ void BenchmarkKernel(const CLApp &cli, const GraphT_ &g,
     auto result = kernel(g);
     trial_timer.Stop();
     gacge::TrialEnd(iter);
+    GACGE_SYNC_REPORT();
     if (gacge::Tracing())
       gacge::TraceEnd(g.num_nodes(), g.num_edges_directed());
     PrintTime("Trial Time", trial_timer.Seconds());
@@ -147,6 +148,7 @@ void BenchmarkKernelPrepared(const CLApp &cli, const GraphT_ &g,
     auto &result = kernel(g);
     trial_timer.Stop();
     gacge::TrialEnd(iter);
+    GACGE_SYNC_REPORT();
     if (gacge::Tracing())
       gacge::TraceEnd(g.num_nodes(), g.num_edges_directed());
     PrintTime("Trial Time", trial_timer.Seconds());

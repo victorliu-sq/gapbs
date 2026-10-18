@@ -48,18 +48,23 @@ int64_t BUStep(const Graph &g, pvector<NodeID> &parent, Bitmap &front,
                Bitmap &next) {
   int64_t awake_count = 0;
   next.reset();
-  #pragma omp parallel for reduction(+ : awake_count) schedule(dynamic, 1024)
-  for (NodeID u=0; u < g.num_nodes(); u++) {
-    if (parent[u] < 0) {
-      for (NodeID v : g.in_neigh(u)) {
-        if (front.get_bit(v)) {
-          parent[u] = v;
-          awake_count++;
-          next.set_bit(u);
-          break;
+  #pragma omp parallel
+  {
+    GACGE_SYNC_BEGIN(1);  // GACGE: barrier wait (gacge.h sync stats)
+    #pragma omp for reduction(+ : awake_count) schedule(dynamic, 1024) GACGE_NOWAIT
+    for (NodeID u=0; u < g.num_nodes(); u++) {
+      if (parent[u] < 0) {
+        for (NodeID v : g.in_neigh(u)) {
+          if (front.get_bit(v)) {
+            parent[u] = v;
+            awake_count++;
+            next.set_bit(u);
+            break;
+          }
         }
       }
     }
+    GACGE_SYNC_END(1, "bu");
   }
   return awake_count;
 }
@@ -70,6 +75,7 @@ int64_t TDStep(const Graph &g, pvector<NodeID> &parent,
   int64_t scout_count = 0;
   #pragma omp parallel
   {
+    GACGE_SYNC_BEGIN(0);  // GACGE: barrier wait (gacge.h sync stats)
     QueueBuffer<NodeID> lqueue(queue);
     #pragma omp for reduction(+ : scout_count) nowait
     for (auto q_iter = queue.begin(); q_iter < queue.end(); q_iter++) {
@@ -85,6 +91,7 @@ int64_t TDStep(const Graph &g, pvector<NodeID> &parent,
       }
     }
     lqueue.flush();
+    GACGE_SYNC_END(0, "td");
   }
   return scout_count;
 }

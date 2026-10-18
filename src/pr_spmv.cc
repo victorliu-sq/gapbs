@@ -57,14 +57,19 @@ pvector<ScoreT>& PageRankPull(const Graph &g, PRState &s, int max_iters, double 
     #pragma omp parallel for
     for (NodeID n=0; n < g.num_nodes(); n++)
       outgoing_contrib[n] = scores[n] / g.out_degree(n);
-    #pragma omp parallel for reduction(+ : error) schedule(dynamic, 16384)
-    for (NodeID u=0; u < g.num_nodes(); u++) {
-      ScoreT incoming_total = 0;
-      for (NodeID v : g.in_neigh(u))
-        incoming_total += outgoing_contrib[v];
-      ScoreT old_score = scores[u];
-      scores[u] = base_score + kDamp * incoming_total;
-      error += fabs(scores[u] - old_score);
+    #pragma omp parallel
+    {
+      GACGE_SYNC_BEGIN(0);  // GACGE: barrier wait (gacge.h sync stats)
+      #pragma omp for reduction(+ : error) schedule(dynamic, 16384) GACGE_NOWAIT
+      for (NodeID u=0; u < g.num_nodes(); u++) {
+        ScoreT incoming_total = 0;
+        for (NodeID v : g.in_neigh(u))
+          incoming_total += outgoing_contrib[v];
+        ScoreT old_score = scores[u];
+        scores[u] = base_score + kDamp * incoming_total;
+        error += fabs(scores[u] - old_score);
+      }
+      GACGE_SYNC_END(0, "pull");
     }
     if (logging_enabled)
       PrintStep(iter, error);
