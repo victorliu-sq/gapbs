@@ -173,27 +173,31 @@ class CLIterApp : public CLApp {
 class CLPageRank : public CLApp {
   int max_iters_;
   double tolerance_;
+  int chunk_ = 1024;  // GACGE: pr_spmv's pull chunk (vertices per dynamic-schedule chunk; GAP: 16384)
 
  public:
   CLPageRank(int argc, char** argv, std::string name, double tolerance,
              int max_iters) :
     CLApp(argc, argv, name), max_iters_(max_iters), tolerance_(tolerance) {
-    get_args_ += "i:t:";
+    get_args_ += "i:t:c:";
     AddHelpLine('i', "i", "perform at most i iterations",
                 std::to_string(max_iters_));
     AddHelpLine('t', "t", "use tolerance t", std::to_string(tolerance_));
+    AddHelpLine('c', "c", "pull chunk: vertices per scheduled chunk (pr_spmv)", std::to_string(chunk_));
   }
 
   void HandleArg(signed char opt, char* opt_arg) override {
     switch (opt) {
       case 'i': max_iters_ = atoi(opt_arg);            break;
       case 't': tolerance_ = std::stod(opt_arg);            break;
+      case 'c': chunk_ = atoi(opt_arg);                     break;
       default: CLApp::HandleArg(opt, opt_arg);
     }
   }
 
   int max_iters() const { return max_iters_; }
   double tolerance() const { return tolerance_; }
+  int chunk() const { return chunk_; }
 };
 
 

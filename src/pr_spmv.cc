@@ -47,16 +47,11 @@ void PreparePR(const Graph &g, PRState &s) {
     s.scores[n] = init_score;
 }
 
-// GAP's pull chunk: 16384 vertices. The sync-stats build (an experiment only) takes
-// GACGE_PR_CHUNK=<vertices> instead.
-#if GACGE_SYNC_STATS_BUILD
-static const int kPullChunk = getenv("GACGE_PR_CHUNK") ? atoi(getenv("GACGE_PR_CHUNK")) : 16384;
-#else
-static const int kPullChunk = 16384;
-#endif
-
+// GACGE: the pull loop's chunk, vertices per dynamically scheduled chunk, is -c (default
+// 1024; GAP's 16384 left a few chunks far heavier than a thread's share where high-degree
+// vertices cluster in id order, e.g. Hollywood and Sinaweibo, analysis/cpu-char cpu_task.py)
 pvector<ScoreT>& PageRankPull(const Graph &g, PRState &s, int max_iters, double epsilon = 0,
-                              bool logging_enabled = false) {
+                              bool logging_enabled = false, int chunk = 1024) {
   const ScoreT base_score = (1.0f - kDamp) / g.num_nodes();
   pvector<ScoreT> &scores = s.scores;
   pvector<ScoreT> &outgoing_contrib = s.outgoing_contrib;
@@ -68,7 +63,7 @@ pvector<ScoreT>& PageRankPull(const Graph &g, PRState &s, int max_iters, double 
     #pragma omp parallel
     {
       GACGE_SYNC_BEGIN(0);  // GACGE: barrier wait (gacge.h sync stats)
-      #pragma omp for reduction(+ : error) schedule(dynamic, kPullChunk) GACGE_NOWAIT
+      #pragma omp for reduction(+ : error) schedule(dynamic, chunk) GACGE_NOWAIT
       for (NodeID u=0; u < g.num_nodes(); u++) {
         ScoreT incoming_total = 0;
         for (NodeID v : g.in_neigh(u))
@@ -130,7 +125,7 @@ int main(int argc, char* argv[]) {
   PRState state(g);  // GACGE: allocated once, prepared untimed per trial
   auto Prepare = [&state] (const Graph &g) { PreparePR(g, state); };
   auto PRBound = [&state, &cli] (const Graph &g) -> pvector<ScoreT>& {
-    return PageRankPull(g, state, cli.max_iters(), cli.tolerance(), cli.logging_en());
+    return PageRankPull(g, state, cli.max_iters(), cli.tolerance(), cli.logging_en(), cli.chunk());
   };
   auto VerifierBound = [&cli] (const Graph &g, const pvector<ScoreT> &scores) {
     return PRVerifier(g, scores, cli.tolerance());
