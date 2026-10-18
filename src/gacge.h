@@ -163,8 +163,8 @@ inline void TraceEnd(int64_t nodes, int64_t edges) {
 namespace gacge {
 namespace sync {
 constexpr int kRegions = 8, kThreads = 512;
-struct alignas(64) Slot { double begin = 0, mid = -1, end = 0; };
-struct Acc { const char *name = nullptr; int64_t loops = 0; int threads = 0; double span = 0, busy = 0, wait = 0, skew = 0, idle = 0, pre = 0; };
+struct alignas(64) Slot { double begin = 0, mid = -1, end = 0, work = 0, item = 0; };
+struct Acc { const char *name = nullptr; int64_t loops = 0; int threads = 0; double span = 0, busy = 0, wait = 0, skew = 0, idle = 0, pre = 0, work = 0, bound = 0; };
 inline Slot (&slots())[kRegions][kThreads] { static Slot s[kRegions][kThreads]; return s; }
 inline Acc (&acc())[kRegions] { static Acc a[kRegions]; return a; }
 inline bool On() {
@@ -179,11 +179,19 @@ inline void Begin(int r) { if (Counted()) slots()[r][omp_get_thread_num()].begin
 inline void End(int r) { if (Counted()) slots()[r][omp_get_thread_num()].end = omp_get_wtime(); }
 // a point inside a thread's share (SSSP: its relaxations done, its local fusion to follow): busy before it is pre_s
 inline void Mark(int r) { if (Counted()) slots()[r][omp_get_thread_num()].mid = omp_get_wtime(); }
+// one task of w units of work (SSSP: an entry's edges): per loop, the work and the heaviest task
+// give the busy share whole tasks allow, work / (P x max(heaviest, work / P)) (bound_util)
+inline void Item(int r, double w) {
+  if (!Counted()) return;
+  Slot &s = slots()[r][omp_get_thread_num()];
+  s.work += w;
+  s.item = std::max(s.item, w);
+}
 // one thread, after the barrier
 inline void Fold(int r, const char *name) {
   if (!Counted()) return;
   const int P = omp_get_num_threads();
-  double b = slots()[r][0].begin, e = slots()[r][0].end, busy = 0, wait = 0, skew = 0, pre = 0;
+  double b = slots()[r][0].begin, e = slots()[r][0].end, busy = 0, wait = 0, skew = 0, pre = 0, work = 0, item = 0;
   for (int t = 0; t < P; t++) {
     b = std::min(b, slots()[r][t].begin);
     e = std::max(e, slots()[r][t].end);
@@ -196,6 +204,9 @@ inline void Fold(int r, const char *name) {
       pre += slots()[r][t].mid - slots()[r][t].begin;
       slots()[r][t].mid = -1;
     }
+    work += slots()[r][t].work;
+    item = std::max(item, slots()[r][t].item);
+    slots()[r][t].work = slots()[r][t].item = 0;
   }
   Acc &a = acc()[r];
   a.name = name;
@@ -206,6 +217,8 @@ inline void Fold(int r, const char *name) {
   a.wait += wait;
   a.skew += skew;
   a.pre += pre;
+  a.work += work;
+  a.bound += P * std::max(item, work / P);
 }
 inline void Serial(int r, const char *name, double s) {
   if (!Counted()) return;
@@ -222,7 +235,8 @@ inline void Report() {
   for (Acc &a : acc()) {
     if (a.loops)
       printf("XBSync: trial=%d region=%s loops=%" PRId64 " threads=%d span_s=%.9f busy_s=%.9f wait_s=%.9f"
-             " skew_s=%.9f idle_s=%.9f pre_s=%.9f util=%.4f\n", trial(), a.name, a.loops, a.threads, a.span, a.busy, a.wait, a.skew, a.idle, a.pre,
+             " skew_s=%.9f idle_s=%.9f pre_s=%.9f work=%.0f bound_util=%.4f util=%.4f\n", trial(), a.name, a.loops, a.threads, a.span,
+             a.busy, a.wait, a.skew, a.idle, a.pre, a.work, a.bound > 0 ? a.work / a.bound : 0.0,
              a.span > 0 ? a.busy / (a.threads * a.span) : 0.0);
     a = Acc();
   }
@@ -233,6 +247,7 @@ inline void Report() {
 #define GACGE_NOWAIT nowait
 #define GACGE_SYNC_BEGIN(r) gacge::sync::Begin(r)
 #define GACGE_SYNC_MARK(r) gacge::sync::Mark(r)
+#define GACGE_SYNC_ITEM(r, w) gacge::sync::Item(r, w)
 #define GACGE_SYNC_END(r, name)    \
   do {                             \
     gacge::sync::End(r);           \
@@ -246,6 +261,7 @@ inline void Report() {
 #define GACGE_NOWAIT
 #define GACGE_SYNC_BEGIN(r) ((void)0)
 #define GACGE_SYNC_MARK(r) ((void)0)
+#define GACGE_SYNC_ITEM(r, w) ((void)0)
 #define GACGE_SYNC_END(r, name) ((void)0)
 #define GACGE_SYNC_SERIAL(r, name, s) ((void)0)
 #define GACGE_SYNC_REPORT() ((void)0)

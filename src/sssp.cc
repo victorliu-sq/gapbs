@@ -106,6 +106,12 @@ void PrepareSSSP(const WGraph &g, NodeID source, SSSPState &s) {
   s.dist[source] = 0;
 }
 
+// GAP's relaxation chunk: 64 frontier entries. The sync-stats build (an experiment only)
+// takes GACGE_SSSP_CHUNK=<entries> instead.
+#if GACGE_SYNC_STATS_BUILD
+static const int kRelaxChunk = getenv("GACGE_SSSP_CHUNK") ? atoi(getenv("GACGE_SSSP_CHUNK")) : 64;
+#endif
+
 pvector<WeightT>& DeltaStep(const WGraph &g, SSSPState &s, WeightT delta,
                             bool logging_enabled = false) {
   Timer t;
@@ -145,17 +151,25 @@ pvector<WeightT>& DeltaStep(const WGraph &g, SSSPState &s, WeightT delta,
       // GACGE: barrier wait (gacge.h sync stats): the bin's relaxations (to the mark) and the thread's local
       // fusion; region 1: bins of fewer entries than 64 (the chunk) x the threads, region 0 the others
 #if GACGE_SYNC_STATS_BUILD
-      const int sync_r = curr_frontier_tail < 64 * static_cast<size_t>(omp_get_num_threads()) ? 1 : 0;
+      // region 2: fewer entries than threads, 1: fewer than 64 (GAP's chunk) x threads, 0: the others
+      const size_t sync_p = static_cast<size_t>(omp_get_num_threads());
+      const int sync_r = curr_frontier_tail < sync_p ? 2 : curr_frontier_tail < 64 * sync_p ? 1 : 0;
 #else
       const int sync_r = 0;
 #endif
       (void)sync_r;
       GACGE_SYNC_BEGIN(sync_r);
+#if GACGE_SYNC_STATS_BUILD
+      #pragma omp for nowait schedule(dynamic, kRelaxChunk)
+#else
       #pragma omp for nowait schedule(dynamic, 64)
+#endif
       for (size_t i=0; i < curr_frontier_tail; i++) {
         NodeID u = frontier[i];
-        if (dist[u] >= delta * static_cast<WeightT>(curr_bin_index))
+        if (dist[u] >= delta * static_cast<WeightT>(curr_bin_index)) {
+          GACGE_SYNC_ITEM(sync_r, g.out_degree(u) + 1.0);  // GACGE: the entry's edges (stale ones do none)
           RelaxEdges(g, u, delta, dist, local_bins, trace);
+        }
       }
       GACGE_SYNC_MARK(sync_r);
       while (curr_bin_index < local_bins.size() &&
@@ -173,7 +187,7 @@ pvector<WeightT>& DeltaStep(const WGraph &g, SSSPState &s, WeightT delta,
           break;
         }
       }
-      GACGE_SYNC_END(sync_r, sync_r ? "bin_small" : "bin");
+      GACGE_SYNC_END(sync_r, sync_r == 2 ? "bin_tiny" : sync_r == 1 ? "bin_small" : "bin");
       #pragma omp barrier
       #pragma omp single nowait
       {
