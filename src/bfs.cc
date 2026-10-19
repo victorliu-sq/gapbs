@@ -1,7 +1,10 @@
 // Copyright (c) 2015, The Regents of the University of California (Regents)
 // See LICENSE.txt for license details
 
+#include <algorithm>
+#include <cstring>
 #include <iostream>
+#include <omp.h>
 #include <vector>
 
 #include "benchmark.h"
@@ -44,22 +47,79 @@ them in the parent array as negative numbers. Thus, the encoding of parent is:
 
 using namespace std;
 
+// GACGE: the bottom-up step's chunks are ranges of vertices cut once per graph
+// (BUBounds, outside the trials) by both their in-edges (at most
+// GACGE_BFS_BU_EDGES, default 262144, at least 16 ranges a thread and 4096
+// edges a range) and their vertices (at most 1024 or a sixteenth of a thread's
+// share); 0: GAP's 1024-vertex chunks. A vertex's work is its in-edges while
+// most are unvisited (vertex-count chunks of a web graph's dense rows ran long
+// while the others waited, and 1024-vertex chunks had 96 threads contend for the
+// schedule: Sinaweibo's 57K), one read of parent once visited (so the late steps
+// balance by vertices). The ranges are taken dynamically.
+static const int64_t kBUEdges = getenv("GACGE_BFS_BU_EDGES") ? atoll(getenv("GACGE_BFS_BU_EDGES")) : 262144;
+
+pvector<NodeID> BUBounds(const Graph &g) {
+  pvector<NodeID> bounds;
+  bounds.push_back(0);
+  if (kBUEdges > 0) {
+    const int64_t work = g.num_edges_directed() + g.num_nodes();
+    const int64_t per = std::max<int64_t>(4096, std::min(kBUEdges, work / (16 * omp_get_max_threads())));
+    const int64_t vcap = std::max<int64_t>(1024, g.num_nodes() / (16 * omp_get_max_threads()));
+    // cuts at multiples of 64: a bitmap word (64 vertices) is written by one
+    // range only, so next.set_bit needs no atomic (as GAP's 1024-vertex chunks)
+    int64_t acc = 0;
+    NodeID start = 0;
+    for (NodeID u = 0; u < g.num_nodes(); u++) {
+      acc += g.in_degree(u) + 1;
+      if (acc >= per || u + 1 - start >= vcap) {
+        const NodeID b = std::min<int64_t>(g.num_nodes(), ((int64_t)u + 64) / 64 * 64);
+        bounds.push_back(b);
+        acc = 0;
+        start = b;
+        u = b - 1;
+      }
+    }
+  }
+  if (bounds[bounds.size() - 1] != g.num_nodes())
+    bounds.push_back(g.num_nodes());
+  return bounds;
+}
+
 int64_t BUStep(const Graph &g, pvector<NodeID> &parent, Bitmap &front,
-               Bitmap &next) {
+               Bitmap &next, const pvector<NodeID> &bounds) {
   int64_t awake_count = 0;
   next.reset();
   #pragma omp parallel
   {
     GACGE_SYNC_BEGIN(1);  // GACGE: barrier wait (gacge.h sync stats)
-    #pragma omp for reduction(+ : awake_count) schedule(dynamic, 1024) GACGE_NOWAIT
-    for (NodeID u=0; u < g.num_nodes(); u++) {
-      if (parent[u] < 0) {
-        for (NodeID v : g.in_neigh(u)) {
-          if (front.get_bit(v)) {
-            parent[u] = v;
-            awake_count++;
-            next.set_bit(u);
-            break;
+    if (kBUEdges > 0) {
+      const int64_t nchunks = bounds.size() - 1;
+      #pragma omp for reduction(+ : awake_count) schedule(dynamic, 1) GACGE_NOWAIT
+      for (int64_t c = 0; c < nchunks; c++) {
+        for (NodeID u = bounds[c]; u < bounds[c + 1]; u++) {
+          if (parent[u] < 0) {
+            for (NodeID v : g.in_neigh(u)) {
+              if (front.get_bit(v)) {
+                parent[u] = v;
+                awake_count++;
+                next.set_bit(u);
+                break;
+              }
+            }
+          }
+        }
+      }
+    } else {
+      #pragma omp for reduction(+ : awake_count) schedule(dynamic, 1024) GACGE_NOWAIT
+      for (NodeID u=0; u < g.num_nodes(); u++) {
+        if (parent[u] < 0) {
+          for (NodeID v : g.in_neigh(u)) {
+            if (front.get_bit(v)) {
+              parent[u] = v;
+              awake_count++;
+              next.set_bit(u);
+              break;
+            }
           }
         }
       }
@@ -118,6 +178,100 @@ int64_t TDStep(const Graph &g, pvector<NodeID> &parent,
 }
 
 
+// GACGE: the top-down step edge-balanced (the default; GACGE_BFS_TD=vertex is
+// GAP's TDStep above, which splits the queue's vertices over the threads, so a
+// hub's edges are one thread's: busy 7-9% of 96 threads on Arabic, Kron21 and
+// Sinaweibo). A prefix sum of the frontier's degrees splits its out-edges into
+// ranges of about equal size, taken dynamically, so a hub's edges are spread
+// over the threads as the GPU's merge-path advance spreads them. Same
+// relaxation (a claim by compare-and-swap, the thread-local queues), same work.
+static const bool kTDEdges = [] {
+  const char *e = getenv("GACGE_BFS_TD");
+  return e == nullptr || strcmp(e, "vertex") != 0;
+}();
+
+// a frontier below GACGE_BFS_TD_SERIAL entries (default 1024) has its prefix sum by one
+// thread (a degree is a random read of the offsets): one barrier instead of three
+static const int64_t kTDSerial = getenv("GACGE_BFS_TD_SERIAL") ? atoll(getenv("GACGE_BFS_TD_SERIAL")) : 1024;
+
+int64_t TDStepEdges(const Graph &g, pvector<NodeID> &parent, SlidingQueue<NodeID> &queue,
+                    pvector<int64_t> &offs, pvector<int64_t> &sums) {
+  const NodeID *q = queue.begin();
+  const int64_t n = queue.size();
+  int64_t scout_count = 0;
+  int64_t total = 0;
+  #pragma omp parallel
+  {
+    GACGE_SYNC_BEGIN(0);  // GACGE: barrier wait (gacge.h sync stats)
+    // offs[i]: the frontier's edges before entry i; offs[n] = total. A small
+    // frontier's by one thread (one barrier), a large one's by all (three)
+    if (n < kTDSerial) {
+      #pragma omp single
+      {
+        int64_t acc = 0;
+        for (int64_t i = 0; i < n; i++) {
+          offs[i] = acc;
+          acc += g.out_degree(q[i]);
+        }
+        offs[n] = total = acc;
+      }
+    } else {
+      const int P = omp_get_num_threads(), t = omp_get_thread_num();
+      const int64_t lo = n * t / P, hi = n * (t + 1) / P;
+      int64_t s = 0;
+      for (int64_t i = lo; i < hi; i++)
+        s += g.out_degree(q[i]);
+      sums[t] = s;
+      #pragma omp barrier
+      int64_t base = 0;
+      for (int i = 0; i < t; i++)
+        base += sums[i];
+      for (int64_t i = lo; i < hi; i++) {
+        offs[i] = base;
+        base += g.out_degree(q[i]);
+      }
+      #pragma omp single
+      {
+        for (int i = 0; i < P; i++)
+          total += sums[i];
+        offs[n] = total;
+      }
+    }
+    const int P = omp_get_num_threads();
+    // ranges of about 512 edges, at most 16 a thread, taken dynamically
+    const int64_t nchunks = std::max<int64_t>(1, std::min<int64_t>((total + 511) / 512, (int64_t)P * 16));
+    const int64_t chunk = (total + nchunks - 1) / nchunks;
+    QueueBuffer<NodeID> lqueue(queue);
+    #pragma omp for reduction(+ : scout_count) nowait schedule(dynamic, 1)
+    for (int64_t c = 0; c < nchunks; c++) {
+      const int64_t e0 = c * chunk, e1 = std::min(total, e0 + chunk);
+      if (e0 >= e1)
+        continue;
+      // the first entry with edges in [e0, e1): the last i with offs[i] <= e0
+      int64_t i = std::upper_bound(offs.begin(), offs.begin() + n, e0) - offs.begin() - 1;
+      for (; i < n && offs[i] < e1; i++) {
+        const NodeID u = q[i];
+        const NodeID *nb = g.out_neigh(u).begin();
+        const int64_t a = std::max(e0, offs[i]) - offs[i], b = std::min(e1, offs[i + 1]) - offs[i];
+        for (int64_t k = a; k < b; k++) {
+          const NodeID v = nb[k];
+          NodeID curr_val = parent[v];
+          if (curr_val < 0) {
+            if (compare_and_swap(parent[v], curr_val, u)) {
+              lqueue.push_back(v);
+              scout_count += -curr_val;
+            }
+          }
+        }
+      }
+    }
+    lqueue.flush();
+    GACGE_SYNC_END(0, "td");
+  }
+  return scout_count;
+}
+
+
 void QueueToBitmap(const SlidingQueue<NodeID> &queue, Bitmap &bm) {
   #pragma omp parallel for
   for (auto q_iter = queue.begin(); q_iter < queue.end(); q_iter++) {
@@ -126,15 +280,37 @@ void QueueToBitmap(const SlidingQueue<NodeID> &queue, Bitmap &bm) {
   }
 }
 
+// GACGE: word by word, zero words skipped (GAP tested every bit: 1 ms over
+// Sinaweibo's 58M for a frontier of 421); GACGE_BFS_B2Q=bit is GAP's loop
+static const bool kB2QWords = [] {
+  const char *e = getenv("GACGE_BFS_B2Q");
+  return e == nullptr || strcmp(e, "bit") != 0;
+}();
+
 void BitmapToQueue(const Graph &g, const Bitmap &bm,
                    SlidingQueue<NodeID> &queue) {
   #pragma omp parallel
   {
     QueueBuffer<NodeID> lqueue(queue);
-    #pragma omp for nowait
-    for (NodeID n=0; n < g.num_nodes(); n++)
-      if (bm.get_bit(n))
-        lqueue.push_back(n);
+    if (kB2QWords) {
+      const int64_t nw = bm.num_words(), nn = g.num_nodes();
+      #pragma omp for nowait schedule(dynamic, 1024)
+      for (int64_t w = 0; w < nw; w++) {
+        uint64_t x = bm.word(w);
+        while (x != 0) {
+          const int b = __builtin_ctzll(x);
+          const int64_t n = w * 64 + b;
+          if (n < nn)
+            lqueue.push_back(n);
+          x &= x - 1;
+        }
+      }
+    } else {
+      #pragma omp for nowait
+      for (NodeID n=0; n < g.num_nodes(); n++)
+        if (bm.get_bit(n))
+          lqueue.push_back(n);
+    }
     lqueue.flush();
   }
   queue.slide_window();
@@ -156,8 +332,11 @@ struct BFSState {
   pvector<NodeID> parent;
   SlidingQueue<NodeID> queue;
   Bitmap curr, front;
+  pvector<int64_t> offs, sums;  // TDStepEdges: the frontier's edge offsets, the threads' partial sums
+  pvector<NodeID> bu_bounds;    // BUStep's vertex ranges (BUBounds)
   explicit BFSState(const Graph &g) : parent(g.num_nodes()), queue(g.num_nodes()),
-      curr(g.num_nodes()), front(g.num_nodes()) {}
+      curr(g.num_nodes()), front(g.num_nodes()), offs(g.num_nodes() + 1, 0),
+      sums(omp_get_max_threads() + 1, 0), bu_bounds(BUBounds(g)) {}
 };
 
 void PrepareBFS(const Graph &g, NodeID source, BFSState &s) {
@@ -206,7 +385,7 @@ pvector<NodeID>& DOBFS(const Graph &g, BFSState &s, bool logging_enabled = false
         old_awake_count = awake_count;
         {
           gacge::PerfPhaseRegion r("bu");  // GACGE: GACGE_PERF_PHASE=bu counts the bottom-up steps
-          awake_count = BUStep(g, parent, front, curr);
+          awake_count = BUStep(g, parent, front, curr, s.bu_bounds);
         }
         front.swap(curr);
         t.Stop();
@@ -225,7 +404,7 @@ pvector<NodeID>& DOBFS(const Graph &g, BFSState &s, bool logging_enabled = false
       edges_to_check -= scout_count;
       {
         gacge::PerfPhaseRegion r("td");  // GACGE: GACGE_PERF_PHASE=td counts the top-down steps
-        scout_count = TDStep(g, parent, queue);
+        scout_count = kTDEdges ? TDStepEdges(g, parent, queue, s.offs, s.sums) : TDStep(g, parent, queue);
       }
       queue.slide_window();
       t.Stop();
@@ -233,10 +412,14 @@ pvector<NodeID>& DOBFS(const Graph &g, BFSState &s, bool logging_enabled = false
         PrintStep("td", t.Seconds(), queue.size());
     }
   }
+  t.Start();
   #pragma omp parallel for
   for (NodeID n = 0; n < g.num_nodes(); n++)
     if (parent[n] < -1)
       parent[n] = -1;
+  t.Stop();
+  if (logging_enabled)
+    PrintStep("f", t.Seconds());
   return parent;
 }
 

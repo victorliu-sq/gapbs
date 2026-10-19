@@ -32,9 +32,22 @@ class Bitmap {
     delete[] start_;
   }
 
+  // GACGE: in parallel from 1M bits (BFS's bottom-up step clears one each step;
+  // Sinaweibo's 7 MB took 0.5 ms serially)
   void reset() {
-    std::fill(start_, end_, 0);
+    const int64_t num_words = end_ - start_;
+    if (num_words < (1 << 14)) {
+      std::fill(start_, end_, 0);
+      return;
+    }
+    #pragma omp parallel for
+    for (int64_t i = 0; i < num_words; i++)
+      start_[i] = 0;
   }
+
+  // GACGE: the words, for word-wise scans (BitmapToQueue)
+  uint64_t word(size_t w) const { return start_[w]; }
+  size_t num_words() const { return end_ - start_; }
 
   void set_bit(size_t pos) {
     start_[word_offset(pos)] |= ((uint64_t) 1l << bit_offset(pos));
