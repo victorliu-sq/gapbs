@@ -1,9 +1,12 @@
 // Copyright (c) 2015, The Regents of the University of California (Regents)
 // See LICENSE.txt for license details
 
+#include <algorithm>
 #include <cinttypes>
+#include <cstring>
 #include <limits>
 #include <iostream>
+#include <omp.h>
 #include <queue>
 #include <vector>
 
@@ -66,13 +69,17 @@ const WeightT kDistInf = numeric_limits<WeightT>::max()/2;
 const size_t kMaxBin = numeric_limits<size_t>::max()/2;
 const size_t kBinSizeThreshold = 1000;
 
+// GACGE: u's out-edges [k0, k1) (the frontier's edge ranges: TDStep-like
+// splitting of a hub's edges over the threads; the fusion relaxes whole vertices)
 inline
 void RelaxEdges(const WGraph &g, NodeID u, WeightT delta,
                 pvector<WeightT> &dist, vector <vector<NodeID>> &local_bins,
-                bool trace = false) {
+                bool trace, int64_t k0, int64_t k1) {
   if (trace)  // GACGE: every relaxation, the bin fusion's included (gacge.h)
-    gacge::TraceWork(g.out_degree(u));
-  for (WNode wn : g.out_neigh(u)) {
+    gacge::TraceWork(k1 - k0);
+  const WNode *nb = g.out_neigh(u).begin();
+  for (int64_t k = k0; k < k1; k++) {
+    const WNode wn = nb[k];
     WeightT old_dist = dist[wn.v];
     WeightT new_dist = dist[u] + wn.w;
     while (new_dist < old_dist) {
@@ -88,14 +95,27 @@ void RelaxEdges(const WGraph &g, NodeID u, WeightT delta,
   }
 }
 
-// GACGE: DeltaStep's distances and shared frontier (one entry per directed
-// edge), allocated once outside the trials; PrepareSSSP sets them to what
-// DeltaStep initialized at its start, untimed (BenchmarkKernelPrepared).
+// GACGE: DeltaStep's distances, shared frontier (one entry per directed edge)
+// and the threads' bins (GAP's local_bins: allocated inside each trial and
+// grown by push_back, here kept across the trials with their capacity, as the
+// GPU's bins are allocated once), allocated outside the trials; PrepareSSSP
+// sets them to what DeltaStep initialized at its start, untimed
+// (BenchmarkKernelPrepared).
+struct SSSPThread {
+  vector<vector<NodeID>> bins;  // GAP's local_bins
+  vector<NodeID> fused;         // a fusion round's vertices (GAP copied the bin)
+  vector<int64_t> offs;         // a small frontier's edge offsets, every thread its own
+};
 struct SSSPState {
   NodeID source = -1;
   pvector<WeightT> dist;
   pvector<NodeID> frontier;
-  explicit SSSPState(const WGraph &g) : dist(g.num_nodes()), frontier(g.num_edges_directed()) {}
+  vector<SSSPThread> threads;
+  pvector<int64_t> offs;  // a large frontier's edge offsets (frontier[i]'s edges before it)
+  pvector<int64_t> sums;  // the threads' partial sums
+  explicit SSSPState(const WGraph &g) : dist(g.num_nodes()), frontier(g.num_edges_directed()),
+      threads(omp_get_max_threads()), offs(g.num_edges_directed() + 1, 0),
+      sums(omp_get_max_threads() + 1, 0) {}
 };
 
 void PrepareSSSP(const WGraph &g, NodeID source, SSSPState &s) {
@@ -104,6 +124,31 @@ void PrepareSSSP(const WGraph &g, NodeID source, SSSPState &s) {
   for (NodeID n = 0; n < g.num_nodes(); n++)
     s.dist[n] = kDistInf;
   s.dist[source] = 0;
+  for (SSSPThread &t : s.threads) {
+    for (vector<NodeID> &b : t.bins)
+      b.clear();
+    t.fused.clear();
+  }
+}
+
+// GACGE: the relaxation loop. GACGE_SSSP_RELAX=edges: the live entries' edges in
+// ranges of about equal size (a prefix sum of their degrees: a frontier below
+// GACGE_SSSP_SMALL entries, default 1024, by every thread for itself, no barrier;
+// a larger one by all, two barriers), so a hub's edges are spread over the
+// threads; entry: GAP's loop over the entries, a hub's edges one thread's, in
+// chunks of GACGE_SSSP_CHUNK entries (GAP's 64; 0, the default: at least 64 and
+// a sixteenth of a thread's share, so a large bin is not 100K chunks). Default
+// (auto): edges when the graph's average degree is at least GACGE_SSSP_EDGES_DEG
+// (16): the prefix sum reads a degree per entry, which a low-degree graph's few
+// relaxations per entry do not amortize (Sinaweibo, 9 edges a vertex: +10%).
+static const int64_t kSmallFrontier = getenv("GACGE_SSSP_SMALL") ? atoll(getenv("GACGE_SSSP_SMALL")) : 1024;
+static const int64_t kEntryChunk = getenv("GACGE_SSSP_CHUNK") ? atoll(getenv("GACGE_SSSP_CHUNK")) : 0;
+static const int64_t kEdgesDeg = getenv("GACGE_SSSP_EDGES_DEG") ? atoll(getenv("GACGE_SSSP_EDGES_DEG")) : 16;
+static bool RelaxByEdges(const WGraph &g) {
+  const char *e = getenv("GACGE_SSSP_RELAX");
+  if (e != nullptr && strcmp(e, "entry") == 0) return false;
+  if (e != nullptr && strcmp(e, "edges") == 0) return true;
+  return g.num_edges_directed() / g.num_nodes() >= kEdgesDeg;
 }
 
 // GAP's relaxation chunk: 64 frontier entries. The sync-stats build (an experiment only)
@@ -123,10 +168,13 @@ pvector<WeightT>& DeltaStep(const WGraph &g, SSSPState &s, WeightT delta,
   size_t frontier_tails[2] = {1, 0};
   frontier[0] = source;
   const bool trace = gacge::Tracing();  // GACGE: one XBStep line per bin iteration (gacge.h)
+  static const bool kRelaxEdges = RelaxByEdges(g);
   t.Start();
   #pragma omp parallel
   {
-    vector<vector<NodeID> > local_bins(0);
+    const int P = omp_get_num_threads(), tid = omp_get_thread_num();
+    SSSPThread &ts = s.threads[tid];
+    vector<vector<NodeID> > &local_bins = ts.bins;
     size_t iter = 0;
     while (shared_indexes[iter&1] != kMaxBin) {
       size_t &curr_bin_index = shared_indexes[iter&1];
@@ -159,31 +207,99 @@ pvector<WeightT>& DeltaStep(const WGraph &g, SSSPState &s, WeightT delta,
 #endif
       (void)sync_r;
       GACGE_SYNC_BEGIN(sync_r);
+      const WeightT floor_d = delta * static_cast<WeightT>(curr_bin_index);
+      if (kRelaxEdges) {
+        // the live entries' out-edges in ranges of about 512, at most 16 a
+        // thread, taken dynamically (a stale entry, GAP's check, has none)
+        const int64_t n = curr_frontier_tail;
+        const int64_t *offs;
+        int64_t total = 0;
+        if (n < kSmallFrontier) {
+          ts.offs.resize(n + 1);
+          for (int64_t i = 0; i < n; i++) {
+            ts.offs[i] = total;
+            const NodeID u = frontier[i];
+            if (dist[u] >= floor_d)
+              total += g.out_degree(u);
+          }
+          ts.offs[n] = total;
+          offs = ts.offs.data();
+        } else {
+          const int64_t lo = n * tid / P, hi = n * (tid + 1) / P;
+          int64_t part = 0;
+          for (int64_t i = lo; i < hi; i++) {
+            const NodeID u = frontier[i];
+            if (dist[u] >= floor_d)
+              part += g.out_degree(u);
+          }
+          s.sums[tid] = part;
+          #pragma omp barrier
+          int64_t base = 0;
+          for (int i = 0; i < tid; i++)
+            base += s.sums[i];
+          for (int64_t i = lo; i < hi; i++) {
+            s.offs[i] = base;
+            const NodeID u = frontier[i];
+            if (dist[u] >= floor_d)
+              base += g.out_degree(u);
+          }
+          if (tid == P - 1)
+            s.offs[n] = base;
+          for (int i = 0; i < P; i++)
+            total += s.sums[i];
+          #pragma omp barrier
+          offs = s.offs.data();
+        }
+        const int64_t nchunks = max<int64_t>(1, min<int64_t>((total + 511) / 512, (int64_t)P * 16));
+        const int64_t chunk = (total + nchunks - 1) / nchunks;
+        #pragma omp for nowait schedule(dynamic, 1)
+        for (int64_t c = 0; c < nchunks; c++) {
+          const int64_t e0 = c * chunk, e1 = min(total, e0 + chunk);
+          if (e0 >= e1)
+            continue;
+          int64_t i = upper_bound(offs, offs + n, e0) - offs - 1;
+          for (; i < n && offs[i] < e1; i++) {
+            if (offs[i + 1] == offs[i])
+              continue;
+            const NodeID u = frontier[i];
+            const int64_t a = max(e0, offs[i]) - offs[i], b = min(e1, offs[i + 1]) - offs[i];
+            GACGE_SYNC_ITEM(sync_r, b - a + 1.0);  // GACGE: the range's edges
+            RelaxEdges(g, u, delta, dist, local_bins, trace, a, b);
+          }
+        }
+      } else {
 #if GACGE_SYNC_STATS_BUILD
-      #pragma omp for nowait schedule(dynamic, kRelaxChunk)
+        const int64_t chunk = kRelaxChunk;
 #else
-      #pragma omp for nowait schedule(dynamic, 64)
+        const int64_t chunk = kEntryChunk > 0 ? kEntryChunk
+            : max<int64_t>(64, (int64_t)curr_frontier_tail / (16 * P));
 #endif
-      for (size_t i=0; i < curr_frontier_tail; i++) {
-        NodeID u = frontier[i];
-        if (dist[u] >= delta * static_cast<WeightT>(curr_bin_index)) {
-          GACGE_SYNC_ITEM(sync_r, g.out_degree(u) + 1.0);  // GACGE: the entry's edges (stale ones do none)
-          RelaxEdges(g, u, delta, dist, local_bins, trace);
+        #pragma omp for nowait schedule(dynamic, chunk)
+        for (size_t i=0; i < curr_frontier_tail; i++) {
+          NodeID u = frontier[i];
+          if (dist[u] >= floor_d) {
+            GACGE_SYNC_ITEM(sync_r, g.out_degree(u) + 1.0);  // GACGE: the entry's edges (stale ones do none)
+            RelaxEdges(g, u, delta, dist, local_bins, trace, 0, g.out_degree(u));
+          }
         }
       }
       GACGE_SYNC_MARK(sync_r);
       while (curr_bin_index < local_bins.size() &&
              !local_bins[curr_bin_index].empty() &&
              local_bins[curr_bin_index].size() < kBinSizeThreshold) {
-        vector<NodeID> curr_bin_copy = local_bins[curr_bin_index];
-        local_bins[curr_bin_index].resize(0);
-        for (NodeID u : curr_bin_copy)
-          RelaxEdges(g, u, delta, dist, local_bins, trace);
+        // the bin's vertices, taken whole (GAP copied them; the swap keeps the capacities)
+        ts.fused.swap(local_bins[curr_bin_index]);
+        local_bins[curr_bin_index].clear();
+        for (NodeID u : ts.fused)
+          RelaxEdges(g, u, delta, dist, local_bins, trace, 0, g.out_degree(u));
+        ts.fused.clear();
       }
       for (size_t i=curr_bin_index; i < local_bins.size(); i++) {
         if (!local_bins[i].empty()) {
-          #pragma omp critical
-          next_bin_index = min(next_bin_index, i);
+          // next_bin_index = min(next_bin_index, i), by compare-and-swap (GAP: omp critical)
+          size_t seen = next_bin_index;
+          while (i < seen && !compare_and_swap(next_bin_index, seen, i))
+            seen = next_bin_index;
           break;
         }
       }

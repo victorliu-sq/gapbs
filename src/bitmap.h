@@ -45,8 +45,12 @@ class Bitmap {
       start_[i] = 0;
   }
 
-  // GACGE: the words, for word-wise scans (BitmapToQueue)
+  // GACGE: the words, for word-wise scans (BitmapToQueue) and clearing a
+  // range's own words (BUStep: the words of bits [pos0, pos1), pos0 a multiple of 64)
   uint64_t word(size_t w) const { return start_[w]; }
+  void clear_words(size_t pos0, size_t pos1) {
+    std::fill(start_ + word_offset(pos0), start_ + (pos1 + kBitsPerWord - 1) / kBitsPerWord, 0);
+  }
   size_t num_words() const { return end_ - start_; }
 
   void set_bit(size_t pos) {

@@ -88,7 +88,8 @@ pvector<NodeID> BUBounds(const Graph &g) {
 int64_t BUStep(const Graph &g, pvector<NodeID> &parent, Bitmap &front,
                Bitmap &next, const pvector<NodeID> &bounds) {
   int64_t awake_count = 0;
-  next.reset();
+  if (kBUEdges <= 0)
+    next.reset();
   #pragma omp parallel
   {
     GACGE_SYNC_BEGIN(1);  // GACGE: barrier wait (gacge.h sync stats)
@@ -96,6 +97,7 @@ int64_t BUStep(const Graph &g, pvector<NodeID> &parent, Bitmap &front,
       const int64_t nchunks = bounds.size() - 1;
       #pragma omp for reduction(+ : awake_count) schedule(dynamic, 1) GACGE_NOWAIT
       for (int64_t c = 0; c < nchunks; c++) {
+        next.clear_words(bounds[c], bounds[c + 1]);  // a range's own words (GAP: next.reset() first)
         for (NodeID u = bounds[c]; u < bounds[c + 1]; u++) {
           if (parent[u] < 0) {
             for (NodeID v : g.in_neigh(u)) {
