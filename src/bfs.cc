@@ -57,14 +57,22 @@ using namespace std;
 // schedule: Sinaweibo's 57K), one read of parent once visited (so the late steps
 // balance by vertices). The ranges are taken dynamically.
 static const int64_t kBUEdges = getenv("GACGE_BFS_BU_EDGES") ? atoll(getenv("GACGE_BFS_BU_EDGES")) : 262144;
+// the number of ranges: a range per 64K units of work, at least 4 a thread, at
+// most 16 (GACGE_BFS_BU_RANGES fixes the ranges a thread instead): 16 a thread
+// made a small graph's step a schedule of 1500 ranges (GPlus 0.36 -> 0.28 ms
+// with 4), 4 a thread left Arabic's 3.5% slower than 16
+static const int64_t kBURanges = getenv("GACGE_BFS_BU_RANGES") ? atoll(getenv("GACGE_BFS_BU_RANGES")) : 0;
 
 pvector<NodeID> BUBounds(const Graph &g) {
   pvector<NodeID> bounds;
   bounds.push_back(0);
   if (kBUEdges > 0) {
     const int64_t work = g.num_edges_directed() + g.num_nodes();
-    const int64_t per = std::max<int64_t>(4096, std::min(kBUEdges, work / (16 * omp_get_max_threads())));
-    const int64_t vcap = std::max<int64_t>(1024, g.num_nodes() / (16 * omp_get_max_threads()));
+    const int64_t P = omp_get_max_threads();
+    const int64_t ranges = kBURanges > 0 ? kBURanges * P
+        : std::min<int64_t>(16 * P, std::max<int64_t>(4 * P, work / 65536));
+    const int64_t per = std::max<int64_t>(4096, std::min(kBUEdges, work / ranges));
+    const int64_t vcap = std::max<int64_t>(1024, g.num_nodes() / ranges);
     // cuts at multiples of 64: a bitmap word (64 vertices) is written by one
     // range only, so next.set_bit needs no atomic (as GAP's 1024-vertex chunks)
     int64_t acc = 0;
@@ -196,12 +204,39 @@ static const bool kTDEdges = [] {
 // thread (a degree is a random read of the offsets): one barrier instead of three
 static const int64_t kTDSerial = getenv("GACGE_BFS_TD_SERIAL") ? atoll(getenv("GACGE_BFS_TD_SERIAL")) : 1024;
 
+// GACGE: a frontier of fewer than GACGE_BFS_TD_EDGES edges (default 4096; 0:
+// never) runs on the calling thread with no parallel region: a 96-thread
+// region and its barriers cost 20-30 us, a high-diameter graph's many small
+// steps. (A team sized to the frontier, num_threads(k), made libgomp rebuild
+// its bound thread pool at every change: milliseconds a step.)
+static const int64_t kTDEdgesPerThread = getenv("GACGE_BFS_TD_EDGES") ? atoll(getenv("GACGE_BFS_TD_EDGES")) : 4096;
+
+int64_t TDStepSerial(const Graph &g, pvector<NodeID> &parent, SlidingQueue<NodeID> &queue) {
+  int64_t scout_count = 0;
+  QueueBuffer<NodeID> lqueue(queue);
+  for (auto q_iter = queue.begin(); q_iter < queue.end(); q_iter++) {
+    NodeID u = *q_iter;
+    for (NodeID v : g.out_neigh(u)) {
+      NodeID curr_val = parent[v];
+      if (curr_val < 0) {
+        parent[v] = u;
+        lqueue.push_back(v);
+        scout_count += -curr_val;
+      }
+    }
+  }
+  lqueue.flush();
+  return scout_count;
+}
+
 int64_t TDStepEdges(const Graph &g, pvector<NodeID> &parent, SlidingQueue<NodeID> &queue,
-                    pvector<int64_t> &offs, pvector<int64_t> &sums) {
+                    pvector<int64_t> &offs, pvector<int64_t> &sums, int64_t edges_est) {
   const NodeID *q = queue.begin();
   const int64_t n = queue.size();
   int64_t scout_count = 0;
   int64_t total = 0;
+  if (kTDEdgesPerThread > 0 && edges_est < kTDEdgesPerThread)
+    return TDStepSerial(g, parent, queue);
   #pragma omp parallel
   {
     GACGE_SYNC_BEGIN(0);  // GACGE: barrier wait (gacge.h sync stats)
@@ -406,7 +441,11 @@ pvector<NodeID>& DOBFS(const Graph &g, BFSState &s, bool logging_enabled = false
       edges_to_check -= scout_count;
       {
         gacge::PerfPhaseRegion r("td");  // GACGE: GACGE_PERF_PHASE=td counts the top-down steps
-        scout_count = kTDEdges ? TDStepEdges(g, parent, queue, s.offs, s.sums) : TDStep(g, parent, queue);
+        // the frontier's edges: the last top-down step's scout count, or after a
+        // bottom-up phase (scout_count = 1) the queue's size x the average degree
+        const int64_t est = scout_count > 1 ? scout_count
+            : (int64_t)queue.size() * std::max<int64_t>(1, g.num_edges_directed() / g.num_nodes());
+        scout_count = kTDEdges ? TDStepEdges(g, parent, queue, s.offs, s.sums, est) : TDStep(g, parent, queue);
       }
       queue.slide_window();
       t.Stop();
